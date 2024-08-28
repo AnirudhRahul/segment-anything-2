@@ -142,7 +142,7 @@ class AsyncVideoFrameLoader:
                 index = 0
                 while index < len(self.img_paths):
                     # Don't load frames too far ahead
-                    while index > self.last_accessed_frame + self.loading_threshold:
+                    while index > self.last_accessed_frame + self.max_frame_cache:
                         pass  # Stall and wait
 
                     self._load_frame_from_disk(index)
