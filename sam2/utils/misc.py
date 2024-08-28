@@ -139,15 +139,17 @@ class AsyncVideoFrameLoader:
         # load the rest of frames asynchronously without blocking the session start
         def _load_frames(self):
             try:
-                index = 0
-                while index < len(self.img_paths):
-                    # Don't load frames too far ahead
-                    while index > self.last_accessed_frame + self.max_frame_cache:
-                        pass  # Stall and wait
+                with tqdm(total=len(self.img_paths), desc="Async frame loading (JPEG)") as pbar:
+                    index = 0
+                    while index < len(self.img_paths):
+                        # Don't load frames too far ahead
+                        while index > self.last_accessed_frame + self.max_frame_cache:
+                            pass  # Stall and wait
 
-                    self._load_frame_from_disk(index)
+                        self._load_frame_from_disk(index)
+                        pbar.update(1)
 
-                    index += 1
+                        index += 1
 
             except Exception as e:
                 self.exception = e
