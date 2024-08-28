@@ -131,7 +131,7 @@ class AsyncVideoFrameLoader:
         self.compute_device = compute_device
         self.last_accessed_frame = 0
         self.max_frame_cache = max_frame_cache
-        
+
         # load the first frame to fill video_height and video_width and also
         # to cache it (since it's most likely where the user will click)
         self.__getitem__(0)
@@ -174,13 +174,11 @@ class AsyncVideoFrameLoader:
             raise RuntimeError("Failure in frame loading thread") from self.exception
 
         self.last_accessed_frame = max(self.last_accessed_frame, index)
-        
+
         if index in self.images:
             return self.images[index]
         else:
             return self._load_frame_from_disk(index)
-
-
 
     def __len__(self):
         return len(self.images)
