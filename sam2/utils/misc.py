@@ -114,6 +114,7 @@ class AsyncVideoFrameLoader:
         img_mean,
         img_std,
         compute_device,
+        max_frame_cache=100,
     ):
         self.img_paths = img_paths
         self.image_size = image_size
@@ -121,37 +122,40 @@ class AsyncVideoFrameLoader:
         self.img_mean = img_mean
         self.img_std = img_std
         # items in `self.images` will be loaded asynchronously
-        self.images = [None] * len(img_paths)
+        self.images = {}
         # catch and raise any exceptions in the async loading thread
         self.exception = None
         # video_height and video_width be filled when loading the first image
         self.video_height = None
         self.video_width = None
         self.compute_device = compute_device
-
+        self.last_accessed_frame = 0
+        self.max_frame_cache = max_frame_cache
+        
         # load the first frame to fill video_height and video_width and also
         # to cache it (since it's most likely where the user will click)
         self.__getitem__(0)
 
         # load the rest of frames asynchronously without blocking the session start
-        def _load_frames():
+        def _load_frames(self):
             try:
-                for n in tqdm(range(len(self.images)), desc="frame loading (JPEG)"):
-                    self.__getitem__(n)
+                index = 0
+                while index < len(self.img_paths):
+                    # Don't load frames too far ahead
+                    while index > self.last_accessed_frame + self.loading_threshold:
+                        pass  # Stall and wait
+
+                    self._load_frame_from_disk(index)
+
+                    index += 1
+
             except Exception as e:
                 self.exception = e
 
         self.thread = Thread(target=_load_frames, daemon=True)
         self.thread.start()
 
-    def __getitem__(self, index):
-        if self.exception is not None:
-            raise RuntimeError("Failure in frame loading thread") from self.exception
-
-        img = self.images[index]
-        if img is not None:
-            return img
-
+    def _load_frame_from_disk(self, index):
         img, video_height, video_width = _load_img_as_tensor(
             self.img_paths[index], self.image_size
         )
@@ -164,6 +168,19 @@ class AsyncVideoFrameLoader:
             img = img.to(self.compute_device, non_blocking=True)
         self.images[index] = img
         return img
+
+    def __getitem__(self, index):
+        if self.exception:
+            raise RuntimeError("Failure in frame loading thread") from self.exception
+
+        self.last_accessed_frame = max(self.last_accessed_frame, index)
+        
+        if index in self.images:
+            return self.images[index]
+        else:
+            return self._load_frame_from_disk(index)
+
+
 
     def __len__(self):
         return len(self.images)
