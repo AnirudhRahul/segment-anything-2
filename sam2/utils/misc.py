@@ -12,6 +12,8 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
 
 
 def get_sdpa_settings():
@@ -40,7 +42,7 @@ def get_sdpa_settings():
         old_gpu = True
         use_flash_attn = False
         math_kernel_on = True
-
+    print("SPDA settings: ", old_gpu, use_flash_attn, math_kernel_on)
     return old_gpu, use_flash_attn, math_kernel_on
 
 
@@ -89,21 +91,73 @@ def mask_to_box(masks: torch.Tensor):
     return bbox_coords
 
 
+import cv2
+import time
+import torch
+import numpy as np
+
 def _load_img_as_tensor(img_path, image_size):
-    img_pil = Image.open(img_path)
-    img_np = np.array(img_pil.convert("RGB").resize((image_size, image_size)))
-    if img_np.dtype == np.uint8:  # np.uint8 is expected for JPEG images
-        img_np = img_np / 255.0
-    else:
-        raise RuntimeError(f"Unknown image dtype: {img_np.dtype} on {img_path}")
-    img = torch.from_numpy(img_np).permute(2, 0, 1)
-    video_width, video_height = img_pil.size  # the original video size
+    img_cv = cv2.imread(img_path)
+    img_cv = cv2.resize(img_cv, (image_size, image_size))
+    img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+    img = torch.from_numpy(img_cv).permute(2, 0, 1) / 255.0
+    
+    # Get original image dimensions
+    video_height, video_width = img_cv.shape[:2]
+    
     return img, video_height, video_width
+
+
+import threading
+import time
+from threading import Thread
+from collections import OrderedDict
+
+# Least Recently Added Cache
+class LRACache(OrderedDict):
+    'Limit size, evicting the least recently looked-up key when full'
+
+    def __init__(self, maxsize, *args, **kwds):
+        self.maxsize = maxsize
+        super().__init__(*args, **kwds)
+
+    def __getitem__(self, key):
+        value = super().__getitem__(key)
+        return value
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        if len(self) > self.maxsize:
+            oldest = next(iter(self))
+            del self[oldest]
+
+
+class TaskQueue:
+    def __init__(self, num_workers=3):
+        self.tasks = queue.Queue()
+        self.workers = []
+        for _ in range(num_workers):
+            worker = threading.Thread(target=self._worker)
+            worker.daemon = True  # Set thread as daemon
+            worker.start()
+            self.workers.append(worker)
+
+    def add_task(self, task):
+        self.tasks.put(task)
+
+    def _worker(self):
+        while True:
+            try:
+                frame, func = self.tasks.get(timeout=1)  # Add timeout to allow checking for program exit
+                func(frame)
+                self.tasks.task_done()
+            except queue.Empty:
+                continue
 
 
 class AsyncVideoFrameLoader:
     """
-    A list of video frames to be load asynchronously without blocking session start.
+    A list of video frames to be loaded asynchronously without blocking session start.
     """
 
     def __init__(
@@ -114,59 +168,77 @@ class AsyncVideoFrameLoader:
         img_mean,
         img_std,
         compute_device,
+        cache_size=200,
+        start_frame=0,
     ):
         self.img_paths = img_paths
         self.image_size = image_size
         self.offload_video_to_cpu = offload_video_to_cpu
         self.img_mean = img_mean
         self.img_std = img_std
-        # items in `self.images` will be loaded asynchronously
-        self.images = [None] * len(img_paths)
-        # catch and raise any exceptions in the async loading thread
+        self.compute_device = compute_device
+        self.cache_size = cache_size
+        self.images = LRACache(maxsize=self.cache_size)  # Map of frame index to cached image
         self.exception = None
-        # video_height and video_width be filled when loading the first image
         self.video_height = None
         self.video_width = None
-        self.compute_device = compute_device
+        self.last_accessed_frame = start_frame
+        self.task_queue = TaskQueue(num_workers=10)  # Use TaskQueue instead of ThreadPoolExecutor
 
-        # load the first frame to fill video_height and video_width and also
-        # to cache it (since it's most likely where the user will click)
-        self.__getitem__(0)
+        # Load the first frame
+        self.__getitem__(start_frame)
 
-        # load the rest of frames asynchronously without blocking the session start
-        def _load_frames():
-            try:
-                for n in tqdm(range(len(self.images)), desc="frame loading (JPEG)"):
-                    self.__getitem__(n)
-            except Exception as e:
-                self.exception = e
-
-        self.thread = Thread(target=_load_frames, daemon=True)
+        # Start async loading thread
+        self.thread = Thread(target=self._load_frames, daemon=True)
         self.thread.start()
 
-    def __getitem__(self, index):
-        if self.exception is not None:
-            raise RuntimeError("Failure in frame loading thread") from self.exception
+    def _load_frames(self):
+        try:
+            K = int(self.cache_size * 0.75)
+            just_ran = None
+            while True:
+                current_frame = self.last_accessed_frame
+                # print("current_frame: ", current_frame)
+                end_frame = min(current_frame + K, len(self.img_paths))
 
-        img = self.images[index]
-        if img is not None:
-            return img
+                for frame in range(current_frame, end_frame):
+                    if frame not in self.images:
+                        self.task_queue.add_task((frame, self._load_frame))
+                
+                just_ran = current_frame
+                
+                while just_ran == self.last_accessed_frame:
+                    time.sleep(0.1)  # Wait if we're too far ahead
 
+        except Exception as e:
+            self.exception = e
+
+
+    def _load_frame(self, index):        
         img, video_height, video_width = _load_img_as_tensor(
             self.img_paths[index], self.image_size
         )
         self.video_height = video_height
         self.video_width = video_width
-        # normalize by mean and std
         img -= self.img_mean
         img /= self.img_std
         if not self.offload_video_to_cpu:
             img = img.to(self.compute_device, non_blocking=True)
         self.images[index] = img
-        return img
+
+
+    def __getitem__(self, index):
+        if self.exception:
+            raise RuntimeError("Failure in frame loading thread") from self.exception
+        
+        self.last_accessed_frame = index
+        if index not in self.images:
+            self._load_frame(index)
+        
+        return self.images[index]
 
     def __len__(self):
-        return len(self.images)
+        return len(self.img_paths)
 
 
 def load_video_frames(
@@ -223,9 +295,24 @@ def load_video_frames(
         )
         return lazy_images, lazy_images.video_height, lazy_images.video_width
 
+
     images = torch.zeros(num_frames, 3, image_size, image_size, dtype=torch.float32)
-    for n, img_path in enumerate(tqdm(img_paths, desc="frame loading (JPEG)")):
-        images[n], video_height, video_width = _load_img_as_tensor(img_path, image_size)
+    video_height, video_width = None, None
+
+    def load_image(args):
+        n, img_path = args
+        img, height, width = _load_img_as_tensor(img_path, image_size)
+        return n, img, height, width
+
+    with ThreadPoolExecutor() as executor:
+        futures = [executor.submit(load_image, (n, img_path)) for n, img_path in enumerate(img_paths)]
+        
+        for future in tqdm(as_completed(futures), total=len(futures), desc="frame loading (JPEG)"):
+            n, img, height, width = future.result()
+            images[n] = img
+            if video_height is None:
+                video_height, video_width = height, width
+
     if not offload_video_to_cpu:
         images = images.to(compute_device)
         img_mean = img_mean.to(compute_device)
