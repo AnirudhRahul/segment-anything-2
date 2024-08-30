@@ -183,7 +183,7 @@ class AsyncVideoFrameLoader:
         self.video_height = None
         self.video_width = None
         self.last_accessed_frame = start_frame
-        self.task_queue = TaskQueue(num_workers=10)  # Use TaskQueue instead of ThreadPoolExecutor
+        self.task_queue = TaskQueue(num_workers=4)  # Use TaskQueue instead of ThreadPoolExecutor
 
         # Load the first frame
         self.__getitem__(start_frame)
