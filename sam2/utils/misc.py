@@ -97,9 +97,31 @@ import torch
 import numpy as np
 
 def _load_img_as_tensor(img_path, image_size):
+    # # Create a new directory for resized images
+    # resized_dir = os.path.join(os.path.dirname(img_path), "resized")
+    # os.makedirs(resized_dir, exist_ok=True)
+
+
+    
+
+    # Read image using OpenCV
     img_cv = cv2.imread(img_path)
-    img_cv = cv2.resize(img_cv, (image_size, image_size))
+    # if img_cv is None:
+    #     raise RuntimeError(f"Failed to load image: {img_path}")
+    
+
+    # img_cv = cv2.resize(img_cv, (image_size, image_size))
+    # base_name = os.path.basename(img_path)
+    # new_img_path = os.path.join(resized_dir, f"resized_{base_name}")
+    # cv2.imwrite(new_img_path, img_cv)
+    
+    # Convert BGR to RGB
     img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+    
+    # # Convert to float and normalize
+    # img_np = img_cv.astype(np.float32) / 255.0
+    
+    # Convert to tensor and rearrange dimensions
     img = torch.from_numpy(img_cv).permute(2, 0, 1) / 255.0
     
     # Get original image dimensions
@@ -183,7 +205,7 @@ class AsyncVideoFrameLoader:
         self.video_height = None
         self.video_width = None
         self.last_accessed_frame = start_frame
-        self.task_queue = TaskQueue(num_workers=4)  # Use TaskQueue instead of ThreadPoolExecutor
+        self.task_queue = TaskQueue(num_workers=10)  # Use TaskQueue instead of ThreadPoolExecutor
 
         # Load the first frame
         self.__getitem__(start_frame)
@@ -195,20 +217,24 @@ class AsyncVideoFrameLoader:
     def _load_frames(self):
         try:
             K = int(self.cache_size * 0.75)
-            just_ran = None
-            while True:
-                current_frame = self.last_accessed_frame
-                # print("current_frame: ", current_frame)
-                end_frame = min(current_frame + K, len(self.img_paths))
+            with tqdm(total=len(self.img_paths), initial=self.last_accessed_frame, desc="Loading frames") as pbar:
+                just_ran = None
+                while True:
+                    current_frame = self.last_accessed_frame
+                    # print("current_frame: ", current_frame)
+                    end_frame = min(current_frame + K, len(self.img_paths))
 
-                for frame in range(current_frame, end_frame):
-                    if frame not in self.images:
-                        self.task_queue.add_task((frame, self._load_frame))
-                
-                just_ran = current_frame
-                
-                while just_ran == self.last_accessed_frame:
-                    time.sleep(0.1)  # Wait if we're too far ahead
+                    for frame in range(current_frame, end_frame):
+                        if frame not in self.images:
+                            self.task_queue.add_task((frame, self._load_frame))
+                    
+                    pbar.n = current_frame
+                    pbar.refresh()
+
+                    just_ran = current_frame
+                    
+                    while just_ran == self.last_accessed_frame:
+                        time.sleep(0.1)  # Wait if we're too far ahead
 
         except Exception as e:
             self.exception = e
@@ -233,9 +259,13 @@ class AsyncVideoFrameLoader:
         
         self.last_accessed_frame = index
         if index not in self.images:
+            print(f"Cache miss for frame {index}")
             self._load_frame(index)
-        
-        return self.images[index]
+            return self.images[index]
+        else:
+            res = self.images[index]
+            del self.images[index]
+            return res
 
     def __len__(self):
         return len(self.img_paths)
